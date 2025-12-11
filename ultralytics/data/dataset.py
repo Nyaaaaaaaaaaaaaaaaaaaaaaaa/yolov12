@@ -103,12 +103,19 @@ class YOLODataset(BaseDataset):
                 ne += ne_f
                 nc += nc_f
                 if im_file:
+                    has_comp = lb.shape[1] >= 6
+                    has_orient = lb.shape[1] == 7
+                    completeness = lb[:, 1:2] if has_comp else np.zeros((len(lb), 0), dtype=np.float32)
+                    orientation = lb[:, 2:3] if has_orient else np.zeros((len(lb), 0), dtype=np.float32)
+                    bboxes = lb[:, 3:] if has_orient else (lb[:, 2:] if has_comp else lb[:, 1:])
                     x["labels"].append(
                         {
                             "im_file": im_file,
                             "shape": shape,
                             "cls": lb[:, 0:1],  # n, 1
-                            "bboxes": lb[:, 1:],  # n, 4
+                            "completeness": completeness,  # n, 1 or empty
+                            "orientation": orientation,  # n,1 or empty
+                            "bboxes": bboxes,  # n, 4
                             "segments": segments,
                             "keypoints": keypoint,
                             "normalized": True,
@@ -214,6 +221,8 @@ class YOLODataset(BaseDataset):
         keypoints = label.pop("keypoints", None)
         bbox_format = label.pop("bbox_format")
         normalized = label.pop("normalized")
+        completeness = label.pop("completeness", None)
+        orientation = label.pop("orientation", None)
 
         # NOTE: do NOT resample oriented boxes
         segment_resamples = 100 if self.use_obb else 1000
@@ -226,6 +235,10 @@ class YOLODataset(BaseDataset):
         else:
             segments = np.zeros((0, segment_resamples, 2), dtype=np.float32)
         label["instances"] = Instances(bboxes, segments, keypoints, bbox_format=bbox_format, normalized=normalized)
+        if completeness is not None and completeness.size:
+            label["completeness"] = completeness.astype(np.float32)
+        if orientation is not None and orientation.size:
+            label["orientation"] = orientation.astype(np.float32)
         return label
 
     @staticmethod
@@ -238,7 +251,7 @@ class YOLODataset(BaseDataset):
             value = values[i]
             if k == "img":
                 value = torch.stack(value, 0)
-            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb"}:
+            if k in {"masks", "keypoints", "bboxes", "cls", "segments", "obb", "completeness", "orientation"}:
                 value = torch.cat(value, 0)
             new_batch[k] = value
         new_batch["batch_idx"] = list(new_batch["batch_idx"])

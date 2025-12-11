@@ -119,18 +119,22 @@ def verify_image_label(args):
             nf = 1  # label found
             with open(lb_file) as f:
                 lb = [x.split() for x in f.read().strip().splitlines() if len(x)]
-                if any(len(x) > 6 for x in lb) and (not keypoint):  # is segment
+                has_segments = any(len(x) > 6 for x in lb) and (not keypoint)
+                if has_segments:  # polygon format, assume class + up to 2 attributes + coords
+                    attr_count = 2 if len(lb[0]) > 6 else 1
                     classes = np.array([x[0] for x in lb], dtype=np.float32)
-                    segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in lb]  # (cls, xy1...)
-                    lb = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+                    attrs = np.array([x[1 : 1 + attr_count] for x in lb], dtype=np.float32)
+                    segments = [np.array(x[1 + attr_count :], dtype=np.float32).reshape(-1, 2) for x in lb]
+                    boxes = segments2boxes(segments)
+                    lb = np.concatenate((classes.reshape(-1, 1), attrs, boxes), 1)  # (cls, attrs..., xywh)
                 lb = np.array(lb, dtype=np.float32)
             if nl := len(lb):
                 if keypoint:
                     assert lb.shape[1] == (5 + nkpt * ndim), f"labels require {(5 + nkpt * ndim)} columns each"
                     points = lb[:, 5:].reshape(-1, ndim)[:, :2]
                 else:
-                    assert lb.shape[1] == 5, f"labels require 5 columns, {lb.shape[1]} columns detected"
-                    points = lb[:, 1:]
+                    assert lb.shape[1] in {5, 6, 7}, f"labels require 5, 6 or 7 columns, {lb.shape[1]} detected"
+                    points = lb[:, 3:] if lb.shape[1] >= 7 else (lb[:, 2:] if lb.shape[1] == 6 else lb[:, 1:])
                 assert points.max() <= 1, f"non-normalized or out of bounds coordinates {points[points > 1]}"
                 assert lb.min() >= 0, f"negative label values {lb[lb < 0]}"
 

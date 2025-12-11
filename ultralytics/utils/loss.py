@@ -167,7 +167,8 @@ class v8DetectionLoss:
         self.hyp = h
         self.stride = m.stride  # model strides
         self.nc = m.nc  # number of classes
-        self.no = m.nc + m.reg_max * 4
+        self.extra_nc = getattr(m, "extra_nc", 0)
+        self.no = m.nc + m.reg_max * 4 + self.extra_nc
         self.reg_max = m.reg_max
         self.device = device
 
@@ -207,9 +208,10 @@ class v8DetectionLoss:
         """Calculate the sum of the loss for box, cls and dfl multiplied by batch size."""
         loss = torch.zeros(3, device=self.device)  # box, cls, dfl
         feats = preds[1] if isinstance(preds, tuple) else preds
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
+        pred_split = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc, self.extra_nc), 1
         )
+        pred_distri, pred_scores = pred_split[:2]
 
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
         pred_distri = pred_distri.permute(0, 2, 1).contiguous()
@@ -267,15 +269,26 @@ class v8SegmentationLoss(v8DetectionLoss):
         """Initializes the v8SegmentationLoss class, taking a de-paralleled model as argument."""
         super().__init__(model)
         self.overlap = model.args.overlap_mask
+        self.comp_nc = getattr(model.model[-1], "comp_nc", 0)
+        self.orient_nc = getattr(model.model[-1], "orient_nc", 0)
+        self.attr_nc = self.comp_nc + self.orient_nc
 
     def __call__(self, preds, batch):
         """Calculate and return the loss for the YOLO model."""
-        loss = torch.zeros(4, device=self.device)  # box, cls, dfl
+        loss = torch.zeros(6, device=self.device)  # box, seg, cls, comp, orient, dfl
         feats, pred_masks, proto = preds if len(preds) == 3 else preds[1]
         batch_size, _, mask_h, mask_w = proto.shape  # batch size, number of masks, mask height, mask width
-        pred_distri, pred_scores = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
-            (self.reg_max * 4, self.nc), 1
+        pred_split = torch.cat([xi.view(feats[0].shape[0], self.no, -1) for xi in feats], 2).split(
+            (self.reg_max * 4, self.nc, self.attr_nc), 1
         )
+        pred_distri, pred_scores = pred_split[:2]
+        pred_attr = pred_split[2] if self.attr_nc else None
+        pred_comp, pred_orient = None, None
+        if pred_attr is not None:
+            if self.comp_nc:
+                pred_comp = pred_attr[:, : self.comp_nc]
+            if self.orient_nc:
+                pred_orient = pred_attr[:, self.comp_nc :]
 
         # B, grids, ..
         pred_scores = pred_scores.permute(0, 2, 1).contiguous()
@@ -290,8 +303,14 @@ class v8SegmentationLoss(v8DetectionLoss):
         try:
             batch_idx = batch["batch_idx"].view(-1, 1)
             targets = torch.cat((batch_idx, batch["cls"].view(-1, 1), batch["bboxes"]), 1)
+            if self.comp_nc and "completeness" in batch:
+                targets = torch.cat((targets, batch["completeness"].view(-1, 1)), 1)
+            if self.orient_nc and "orientation" in batch:
+                targets = torch.cat((targets, batch["orientation"].view(-1, 1)), 1)
             targets = self.preprocess(targets.to(self.device), batch_size, scale_tensor=imgsz[[1, 0, 1, 0]])
             gt_labels, gt_bboxes = targets.split((1, 4), 2)  # cls, xyxy
+            gt_comp = targets[..., 5:6] if self.comp_nc else None
+            gt_orient = targets[..., 6:7] if self.orient_nc else None
             mask_gt = gt_bboxes.sum(2, keepdim=True).gt_(0.0)
         except RuntimeError as e:
             raise TypeError(
@@ -322,7 +341,7 @@ class v8SegmentationLoss(v8DetectionLoss):
 
         if fg_mask.sum():
             # Bbox loss
-            loss[0], loss[3] = self.bbox_loss(
+            loss[0], loss[5] = self.bbox_loss(
                 pred_distri,
                 pred_bboxes,
                 anchor_points,
@@ -339,6 +358,10 @@ class v8SegmentationLoss(v8DetectionLoss):
             loss[1] = self.calculate_segmentation_loss(
                 fg_mask, masks, target_gt_idx, target_bboxes, batch_idx, proto, pred_masks, imgsz, self.overlap
             )
+            if self.comp_nc and pred_comp is not None and gt_comp is not None:
+                loss[3] = self.attribute_loss(pred_comp, gt_comp, target_gt_idx, fg_mask, self.comp_nc)
+            if self.orient_nc and pred_orient is not None and gt_orient is not None:
+                loss[4] = self.attribute_loss(pred_orient, gt_orient, target_gt_idx, fg_mask, self.orient_nc)
 
         # WARNING: lines below prevent Multi-GPU DDP 'unused gradient' PyTorch errors, do not remove
         else:
@@ -347,9 +370,36 @@ class v8SegmentationLoss(v8DetectionLoss):
         loss[0] *= self.hyp.box  # box gain
         loss[1] *= self.hyp.box  # seg gain
         loss[2] *= self.hyp.cls  # cls gain
-        loss[3] *= self.hyp.dfl  # dfl gain
+        loss[3] *= self.hyp.get("comp", 1.0) if self.comp_nc else 0.0  # completeness gain
+        loss[4] *= self.hyp.get("orient", 1.0) if self.orient_nc else 0.0  # orientation gain
+        loss[5] *= self.hyp.dfl  # dfl gain
 
         return loss.sum() * batch_size, loss.detach()  # loss(box, cls, dfl)
+
+    def attribute_loss(self, pred_attr, gt_attr, target_gt_idx, fg_mask, num_classes):
+        """Calculate attribute loss (completeness/orientation) for positive anchors."""
+        pos = fg_mask.sum()
+        if pos == 0:
+            return pred_attr.sum() * 0.0
+
+        batch_size = pred_attr.shape[0]
+        target_onehot = torch.zeros(
+            (batch_size, pred_attr.shape[1], num_classes), device=self.device, dtype=pred_attr.dtype
+        )
+        for b in range(batch_size):
+            mask = fg_mask[b]
+            if mask.any():
+                matched = target_gt_idx[b, mask].long().clamp_min(0)
+                attr_vals = gt_attr[b, matched, 0].long().clamp(0, num_classes - 1)
+                target_onehot[b, mask] = F.one_hot(attr_vals, num_classes=num_classes).to(pred_attr.dtype)
+
+        if num_classes == 1:
+            # Binary completeness treated as probability
+            loss_val = self.bce(pred_attr.squeeze(-1), target_onehot.squeeze(-1)).sum() / pos
+        else:
+            target_idx = target_onehot.argmax(dim=-1)
+            loss_val = F.cross_entropy(pred_attr[fg_mask], target_idx[fg_mask], reduction="mean")
+        return loss_val
 
     @staticmethod
     def single_mask_loss(

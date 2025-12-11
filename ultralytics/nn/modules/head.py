@@ -31,13 +31,14 @@ class Detect(nn.Module):
     strides = torch.empty(0)  # init
     legacy = False  # backward compatibility for v3/v5/v8/v9 models
 
-    def __init__(self, nc=80, ch=()):
+    def __init__(self, nc=80, ch=(), extra=0):
         """Initializes the YOLO detection layer with specified number of classes and channels."""
         super().__init__()
         self.nc = nc  # number of classes
         self.nl = len(ch)  # number of detection layers
         self.reg_max = 16  # DFL channels (ch[0] // 16 to scale 4/8/12/16/20 for n/s/m/l/x)
-        self.no = nc + self.reg_max * 4  # number of outputs per anchor
+        self.extra_nc = extra  # additional attribute predictions (e.g., completeness)
+        self.no = nc + self.reg_max * 4 + self.extra_nc  # number of outputs per anchor
         self.stride = torch.zeros(self.nl)  # strides computed during build
         c2, c3 = max((16, ch[0] // 4, self.reg_max * 4)), max(ch[0], min(self.nc, 100))  # channels
         self.cv2 = nn.ModuleList(
@@ -55,11 +56,22 @@ class Detect(nn.Module):
                 for x in ch
             )
         )
+        if self.extra_nc:
+            self.cv_extra = nn.ModuleList(
+                nn.Sequential(
+                    nn.Sequential(DWConv(x, x, 3), Conv(x, c3, 1)),
+                    nn.Sequential(DWConv(c3, c3, 3), Conv(c3, c3, 1)),
+                    nn.Conv2d(c3, self.extra_nc, 1),
+                )
+                for x in ch
+            )
         self.dfl = DFL(self.reg_max) if self.reg_max > 1 else nn.Identity()
 
         if self.end2end:
             self.one2one_cv2 = copy.deepcopy(self.cv2)
             self.one2one_cv3 = copy.deepcopy(self.cv3)
+            if self.extra_nc:
+                self.one2one_cv_extra = copy.deepcopy(self.cv_extra)
 
     def forward(self, x):
         """Concatenates and returns predicted bounding boxes and class probabilities."""
@@ -67,7 +79,10 @@ class Detect(nn.Module):
             return self.forward_end2end(x)
 
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            parts = [self.cv2[i](x[i]), self.cv3[i](x[i])]
+            if self.extra_nc:
+                parts.append(self.cv_extra[i](x[i]))
+            x[i] = torch.cat(parts, 1)
         if self.training:  # Training path
             return x
         y = self._inference(x)
@@ -85,11 +100,16 @@ class Detect(nn.Module):
                            If in training mode, returns a dictionary containing the outputs of one2many and one2one detections separately.
         """
         x_detach = [xi.detach() for xi in x]
-        one2one = [
-            torch.cat((self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])), 1) for i in range(self.nl)
-        ]
+        one2one = []
         for i in range(self.nl):
-            x[i] = torch.cat((self.cv2[i](x[i]), self.cv3[i](x[i])), 1)
+            parts = [self.one2one_cv2[i](x_detach[i]), self.one2one_cv3[i](x_detach[i])]
+            if self.extra_nc:
+                parts.append(self.one2one_cv_extra[i](x_detach[i]))
+            one2one.append(torch.cat(parts, 1))
+            parts = [self.cv2[i](x[i]), self.cv3[i](x[i])]
+            if self.extra_nc:
+                parts.append(self.cv_extra[i](x[i]))
+            x[i] = torch.cat(parts, 1)
         if self.training:  # Training path
             return {"one2many": x, "one2one": one2one}
 
@@ -108,9 +128,12 @@ class Detect(nn.Module):
 
         if self.export and self.format in {"saved_model", "pb", "tflite", "edgetpu", "tfjs"}:  # avoid TF FlexSplitV ops
             box = x_cat[:, : self.reg_max * 4]
-            cls = x_cat[:, self.reg_max * 4 :]
+            cls = x_cat[:, self.reg_max * 4 : self.reg_max * 4 + self.nc]
+            extra = x_cat[:, self.reg_max * 4 + self.nc :] if self.extra_nc else None
         else:
-            box, cls = x_cat.split((self.reg_max * 4, self.nc), 1)
+            splits = (self.reg_max * 4, self.nc, self.extra_nc) if self.extra_nc else (self.reg_max * 4, self.nc)
+            box, cls, *extra_list = x_cat.split(splits, 1)
+            extra = extra_list[0] if extra_list else None
 
         if self.export and self.format in {"tflite", "edgetpu"}:
             # Precompute normalization factor to increase numerical stability
@@ -128,20 +151,27 @@ class Detect(nn.Module):
         else:
             dbox = self.decode_bboxes(self.dfl(box), self.anchors.unsqueeze(0)) * self.strides
 
-        return torch.cat((dbox, cls.sigmoid()), 1)
+        outputs = [dbox, cls.sigmoid()]
+        if extra is not None:
+            outputs.append(extra.sigmoid())
+        return torch.cat(outputs, 1)
 
     def bias_init(self):
         """Initialize Detect() biases, WARNING: requires stride availability."""
         m = self  # self.model[-1]  # Detect() module
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1
         # ncf = math.log(0.6 / (m.nc - 0.999999)) if cf is None else torch.log(cf / cf.sum())  # nominal class frequency
-        for a, b, s in zip(m.cv2, m.cv3, m.stride):  # from
+        for i, (a, b, s) in enumerate(zip(m.cv2, m.cv3, m.stride)):  # from
             a[-1].bias.data[:] = 1.0  # box
             b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+            if m.extra_nc:
+                m.cv_extra[i][-1].bias.data[: m.extra_nc] = 0.0  # neutral start
         if self.end2end:
-            for a, b, s in zip(m.one2one_cv2, m.one2one_cv3, m.stride):  # from
+            for i, (a, b, s) in enumerate(zip(m.one2one_cv2, m.one2one_cv3, m.stride)):  # from
                 a[-1].bias.data[:] = 1.0  # box
                 b[-1].bias.data[: m.nc] = math.log(5 / m.nc / (640 / s) ** 2)  # cls (.01 objects, 80 classes, 640 img)
+                if m.extra_nc:
+                    m.one2one_cv_extra[i][-1].bias.data[: m.extra_nc] = 0.0
 
     def decode_bboxes(self, bboxes, anchors, xywh=True):
         """Decode bounding boxes."""
@@ -175,9 +205,12 @@ class Detect(nn.Module):
 class Segment(Detect):
     """YOLO Segment head for segmentation models."""
 
-    def __init__(self, nc=80, nm=32, npr=256, ch=()):
+    def __init__(self, nc=80, nm=32, npr=256, ch=(), comp_nc=0, orient_nc=0):
         """Initialize the YOLO model attributes such as the number of masks, prototypes, and the convolution layers."""
-        super().__init__(nc, ch)
+        self.comp_nc = comp_nc  # completeness/attribute classes
+        self.orient_nc = orient_nc  # orientation classes
+        extra_nc = comp_nc + orient_nc
+        super().__init__(nc, ch, extra=extra_nc)
         self.nm = nm  # number of masks
         self.npr = npr  # number of protos
         self.proto = Proto(ch[0], self.npr, self.nm)  # protos

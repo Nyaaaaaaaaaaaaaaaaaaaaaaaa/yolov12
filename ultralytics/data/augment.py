@@ -842,11 +842,14 @@ class Mosaic(BaseMixTransform):
         if len(mosaic_labels) == 0:
             return {}
         cls = []
+        completeness = []
         instances = []
         imgsz = self.imgsz * 2  # mosaic imgsz
         for labels in mosaic_labels:
             cls.append(labels["cls"])
             instances.append(labels["instances"])
+            if "completeness" in labels:
+                completeness.append(labels["completeness"])
         # Final labels
         final_labels = {
             "im_file": mosaic_labels[0]["im_file"],
@@ -856,9 +859,13 @@ class Mosaic(BaseMixTransform):
             "instances": Instances.concatenate(instances, axis=0),
             "mosaic_border": self.border,
         }
+        if completeness:
+            final_labels["completeness"] = np.concatenate(completeness, 0)
         final_labels["instances"].clip(imgsz, imgsz)
         good = final_labels["instances"].remove_zero_area_boxes()
         final_labels["cls"] = final_labels["cls"][good]
+        if completeness:
+            final_labels["completeness"] = final_labels["completeness"][good]
         if "texts" in mosaic_labels[0]:
             final_labels["texts"] = mosaic_labels[0]["texts"]
         return final_labels
@@ -946,6 +953,10 @@ class MixUp(BaseMixTransform):
         labels["img"] = (labels["img"] * r + labels2["img"] * (1 - r)).astype(np.uint8)
         labels["instances"] = Instances.concatenate([labels["instances"], labels2["instances"]], axis=0)
         labels["cls"] = np.concatenate([labels["cls"], labels2["cls"]], 0)
+        if "completeness" in labels and "completeness" in labels2:
+            labels["completeness"] = np.concatenate([labels["completeness"], labels2["completeness"]], 0)
+        if "orientation" in labels and "orientation" in labels2:
+            labels["orientation"] = np.concatenate([labels["orientation"], labels2["orientation"]], 0)
         return labels
 
 
@@ -1223,6 +1234,7 @@ class RandomPerspective:
 
         img = labels["img"]
         cls = labels["cls"]
+        completeness = labels.get("completeness")
         instances = labels.pop("instances")
         # Make sure the coord formats are right
         instances.convert_bbox(format="xyxy")
@@ -1256,6 +1268,8 @@ class RandomPerspective:
         )
         labels["instances"] = new_instances[i]
         labels["cls"] = cls[i]
+        if completeness is not None:
+            labels["completeness"] = completeness[i]
         labels["img"] = img
         labels["resized_shape"] = img.shape[:2]
         return labels
@@ -1856,7 +1870,12 @@ class Albumentations:
             # Compose transforms
             self.contains_spatial = any(transform.__class__.__name__ in spatial_transforms for transform in T)
             self.transform = (
-                A.Compose(T, bbox_params=A.BboxParams(format="yolo", label_fields=["class_labels"]))
+                A.Compose(
+                    T,
+                    bbox_params=A.BboxParams(
+                        format="yolo", label_fields=["class_labels", "bbox_completeness", "bbox_orientation"]
+                    ),
+                )
                 if self.contains_spatial
                 else A.Compose(T)
             )
@@ -1904,23 +1923,41 @@ class Albumentations:
             return labels
 
         if self.contains_spatial:
-            cls = labels["cls"]
-            if len(cls):
-                im = labels["img"]
-                labels["instances"].convert_bbox("xywh")
-                labels["instances"].normalize(*im.shape[:2][::-1])
-                bboxes = labels["instances"].bboxes
-                # TODO: add supports of segments and keypoints
-                new = self.transform(image=im, bboxes=bboxes, class_labels=cls)  # transformed
-                if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
-                    labels["img"] = new["image"]
-                    labels["cls"] = np.array(new["class_labels"])
-                    bboxes = np.array(new["bboxes"], dtype=np.float32)
-                labels["instances"].update(bboxes=bboxes)
-        else:
-            labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
+        cls = labels["cls"]
+        completeness = labels.get("completeness")
+        orientation = labels.get("orientation")
+        if len(cls):
+            im = labels["img"]
+            labels["instances"].convert_bbox("xywh")
+            labels["instances"].normalize(*im.shape[:2][::-1])
+            bboxes = labels["instances"].bboxes
+            comp_input = completeness.tolist() if completeness is not None else [0.0] * len(bboxes)
+            orient_input = orientation.tolist() if orientation is not None else [0.0] * len(bboxes)
+            # TODO: add supports of segments and keypoints
+            new = self.transform(
+                image=im,
+                bboxes=bboxes,
+                class_labels=cls,
+                bbox_completeness=comp_input,
+                bbox_orientation=orient_input,
+            )  # transformed
+            if len(new["class_labels"]) > 0:  # skip update if no bbox in new im
+                labels["img"] = new["image"]
+                labels["cls"] = np.array(new["class_labels"])
+                bboxes = np.array(new["bboxes"], dtype=np.float32)
+                if completeness is not None:
+                    completeness = np.array(new["bbox_completeness"], dtype=np.float32)
+                if orientation is not None:
+                    orientation = np.array(new["bbox_orientation"], dtype=np.float32)
+            labels["instances"].update(bboxes=bboxes)
+        if completeness is not None:
+            labels["completeness"] = completeness[: len(labels["cls"])]
+        if orientation is not None:
+            labels["orientation"] = orientation[: len(labels["cls"])]
+    else:
+        labels["img"] = self.transform(image=labels["img"])["image"]  # transformed
 
-        return labels
+    return labels
 
 
 class Format:
@@ -2040,6 +2077,8 @@ class Format:
         img = labels.pop("img")
         h, w = img.shape[:2]
         cls = labels.pop("cls")
+        completeness = labels.pop("completeness", None)
+        orientation = labels.pop("orientation", None)
         instances = labels.pop("instances")
         instances.convert_bbox(format=self.bbox_format)
         instances.denormalize(w, h)
@@ -2047,7 +2086,9 @@ class Format:
 
         if self.return_mask:
             if nl:
-                masks, instances, cls = self._format_segments(instances, cls, w, h)
+                masks, instances, cls, completeness, orientation = self._format_segments(
+                    instances, cls, w, h, completeness, orientation
+                )
                 masks = torch.from_numpy(masks)
             else:
                 masks = torch.zeros(
@@ -2057,6 +2098,12 @@ class Format:
         labels["img"] = self._format_img(img)
         labels["cls"] = torch.from_numpy(cls) if nl else torch.zeros(nl)
         labels["bboxes"] = torch.from_numpy(instances.bboxes) if nl else torch.zeros((nl, 4))
+        if completeness is not None:
+            comp = torch.from_numpy(completeness) if nl else torch.zeros((nl, 1))
+            labels["completeness"] = comp
+        if orientation is not None:
+            orient = torch.from_numpy(orientation) if nl else torch.zeros((nl, 1))
+            labels["orientation"] = orient
         if self.return_keypoint:
             labels["keypoints"] = torch.from_numpy(instances.keypoints)
             if self.normalize:
@@ -2106,7 +2153,7 @@ class Format:
         img = torch.from_numpy(img)
         return img
 
-    def _format_segments(self, instances, cls, w, h):
+    def _format_segments(self, instances, cls, w, h, completeness=None, orientation=None):
         """
         Converts polygon segments to bitmap masks.
 
@@ -2115,11 +2162,15 @@ class Format:
             cls (numpy.ndarray): Class labels for each instance.
             w (int): Width of the image.
             h (int): Height of the image.
+            completeness (numpy.ndarray | None): Optional completeness labels aligned to instances.
+            orientation (numpy.ndarray | None): Optional orientation labels aligned to instances.
 
         Returns:
             masks (numpy.ndarray): Bitmap masks with shape (N, H, W) or (1, H, W) if mask_overlap is True.
             instances (Instances): Updated instances object with sorted segments if mask_overlap is True.
             cls (numpy.ndarray): Updated class labels, sorted if mask_overlap is True.
+            completeness (numpy.ndarray | None): Updated completeness labels if provided.
+            orientation (numpy.ndarray | None): Updated orientation labels if provided.
 
         Notes:
             - If self.mask_overlap is True, masks are overlapped and sorted by area.
@@ -2132,10 +2183,14 @@ class Format:
             masks = masks[None]  # (640, 640) -> (1, 640, 640)
             instances = instances[sorted_idx]
             cls = cls[sorted_idx]
+            if completeness is not None:
+                completeness = completeness[sorted_idx]
+            if orientation is not None:
+                orientation = orientation[sorted_idx]
         else:
             masks = polygons2masks((h, w), segments, color=1, downsample_ratio=self.mask_ratio)
 
-        return masks, instances, cls
+        return masks, instances, cls, completeness, orientation
 
 
 class RandomLoadText:

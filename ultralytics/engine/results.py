@@ -982,8 +982,8 @@ class Boxes(BaseTensor):
 
         Args:
             boxes (torch.Tensor | np.ndarray): A tensor or numpy array with detection boxes of shape
-                (num_boxes, 6) or (num_boxes, 7). Columns should contain
-                [x1, y1, x2, y2, confidence, class, (optional) track_id].
+                (num_boxes, 6 + k) or (num_boxes, 7 + k). Columns should contain
+                [x1, y1, x2, y2, confidence, class, (optional) track_id, (optional) extra attributes].
             orig_shape (Tuple[int, int]): The original image shape as (height, width). Used for normalization.
 
         Attributes:
@@ -1002,10 +1002,14 @@ class Boxes(BaseTensor):
         if boxes.ndim == 1:
             boxes = boxes[None, :]
         n = boxes.shape[-1]
-        assert n in {6, 7}, f"expected 6 or 7 values but got {n}"  # xyxy, track_id, conf, cls
+        assert n >= 6, f"expected at least 6 values but got {n}"  # xyxy, (track_id), conf, cls, (extras)
         super().__init__(boxes, orig_shape)
         self.is_track = n == 7
         self.orig_shape = orig_shape
+        self.conf_idx = 4
+        self.cls_idx = 5
+        self.track_idx = 6 if self.is_track else None
+        self.extra_start = (self.track_idx + 1) if self.is_track else 6
 
     @property
     def xyxy(self):
@@ -1039,7 +1043,7 @@ class Boxes(BaseTensor):
             >>> print(conf_scores)
             tensor([0.9000])
         """
-        return self.data[:, -2]
+        return self.data[:, self.conf_idx]
 
     @property
     def cls(self):
@@ -1056,7 +1060,7 @@ class Boxes(BaseTensor):
             >>> class_ids = boxes.cls
             >>> print(class_ids)  # tensor([0., 2., 1.])
         """
-        return self.data[:, -1]
+        return self.data[:, self.cls_idx]
 
     @property
     def id(self):
@@ -1081,7 +1085,17 @@ class Boxes(BaseTensor):
             - This property is only available when tracking is enabled (i.e., when `is_track` is True).
             - The tracking IDs are typically used to associate detections across multiple frames in video analysis.
         """
-        return self.data[:, -3] if self.is_track else None
+        return self.data[:, self.track_idx] if self.is_track else None
+
+    @property
+    def attrs(self):
+        """
+        Returns any additional per-box attributes stored after the standard columns.
+
+        Returns:
+            (torch.Tensor | numpy.ndarray | None): Attribute tensor of shape (N, k) or None if no extras present.
+        """
+        return self.data[:, self.extra_start :] if self.data.shape[1] > self.extra_start else None
 
     @property
     @lru_cache(maxsize=2)  # maxsize 1 should suffice

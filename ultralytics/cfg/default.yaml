@@ -40,6 +40,10 @@ multi_scale: False # (bool) Whether to use multiscale during training
 # Segmentation
 overlap_mask: True # (bool) merge object masks into a single image mask during training (segment train only)
 mask_ratio: 4 # (int) mask downsample ratio (segment train only)
+comp_nc: 0 # (int) number of completeness/attribute classes for segmentation head (0 disables the branch)
+comp: 1.0 # (float) loss gain for completeness/attribute predictions
+orient_nc: 0 # (int) number of orientation classes (0 disables the branch)
+orient: 1.0 # (float) loss gain for orientation predictions
 # Classification
 dropout: 0.0 # (float) use dropout regularization (classify train only)
 

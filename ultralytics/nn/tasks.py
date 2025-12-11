@@ -403,8 +403,14 @@ class OBBModel(DetectionModel):
 class SegmentationModel(DetectionModel):
     """YOLOv8 segmentation model."""
 
-    def __init__(self, cfg="yolov8n-seg.yaml", ch=3, nc=None, verbose=True):
+    def __init__(self, cfg="yolov8n-seg.yaml", ch=3, nc=None, comp_nc=0, orient_nc=0, verbose=True):
         """Initialize YOLOv8 segmentation model with given config and parameters."""
+        if not isinstance(cfg, dict):
+            cfg = yaml_model_load(cfg)  # load model YAML
+        else:
+            cfg = deepcopy(cfg)
+        cfg["comp_nc"] = comp_nc if comp_nc is not None else cfg.get("comp_nc", 0)
+        cfg["orient_nc"] = orient_nc if orient_nc is not None else cfg.get("orient_nc", 0)
         super().__init__(cfg=cfg, ch=ch, nc=nc, verbose=verbose)
 
     def init_criterion(self):
@@ -1051,9 +1057,11 @@ def parse_model(d, ch, verbose=True):  # model_dict, input_channels(3)
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
         elif m in {Detect, WorldDetect, Segment, Pose, OBB, ImagePoolingAttn, v10Detect}:
-            args.append([ch[x] for x in f])
             if m is Segment:
                 args[2] = make_divisible(min(args[2], max_channels) * width, 8)
+                args.insert(3, d.get("comp_nc", 0))
+                args.insert(4, d.get("orient_nc", 0))
+            args.append([ch[x] for x in f])
             if m in {Detect, Segment, Pose, OBB}:
                 m.legacy = legacy
         elif m is RTDETRDecoder:  # special case, channels arg must be passed in index 1

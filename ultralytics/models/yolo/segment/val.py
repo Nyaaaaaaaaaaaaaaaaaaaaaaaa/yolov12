@@ -70,6 +70,9 @@ class SegmentationValidator(DetectionValidator):
 
     def postprocess(self, preds):
         """Post-processes YOLO predictions and returns output detections with proto."""
+        head = getattr(self.model, "model", [None])[-1] if hasattr(self.model, "model") else None
+        extra = getattr(head, "extra_nc", 0) if head else 0
+        nm = getattr(head, "nm", 0) if head else 0
         p = ops.non_max_suppression(
             preds[0],
             self.args.conf,
@@ -79,6 +82,8 @@ class SegmentationValidator(DetectionValidator):
             agnostic=self.args.single_cls or self.args.agnostic_nms,
             max_det=self.args.max_det,
             nc=self.nc,
+            nm=nm,
+            extra=extra,
         )
         proto = preds[1][-1] if len(preds[1]) == 3 else preds[1]  # second output is len 3 if pt, but only 1 if exported
         return p, proto
@@ -93,7 +98,9 @@ class SegmentationValidator(DetectionValidator):
     def _prepare_pred(self, pred, pbatch, proto):
         """Prepares a batch for training or inference by processing images and targets."""
         predn = super()._prepare_pred(pred, pbatch)
-        pred_masks = self.process(proto, pred[:, 6:], pred[:, :4], shape=pbatch["imgsz"])
+        extra = getattr(self.model.model[-1], "extra_nc", 0)
+        mask_start = 6 + extra
+        pred_masks = self.process(proto, pred[:, mask_start:], pred[:, :4], shape=pbatch["imgsz"])
         return predn, pred_masks
 
     def update_metrics(self, preds, batch):
